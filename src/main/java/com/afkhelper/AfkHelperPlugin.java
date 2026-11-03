@@ -1,33 +1,53 @@
-
 package com.afkhelper;
 
 import com.google.inject.Provides;
 import java.awt.Color;
 import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
+
 import net.runelite.api.Actor;
-import net.runelite.api.AnimationID;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
+import net.runelite.api.InventoryID;
+import net.runelite.api.Item;
+import net.runelite.api.ItemContainer;
 import net.runelite.api.NPC;
 import net.runelite.api.Skill;
+import net.runelite.api.Varbits;
+import net.runelite.api.events.ActorDeath;
 import net.runelite.api.events.AnimationChanged;
+import net.runelite.api.events.DecorativeObjectDespawned;
+import net.runelite.api.events.DecorativeObjectSpawned;
+import net.runelite.api.events.GameObjectDespawned;
+import net.runelite.api.events.GameObjectSpawned;
+import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
+import net.runelite.api.events.GroundObjectDespawned;
+import net.runelite.api.events.GroundObjectSpawned;
+import net.runelite.api.events.HitsplatApplied;
+import net.runelite.api.events.ItemContainerChanged;
+import net.runelite.api.events.StatChanged;
+import net.runelite.api.events.WallObjectDespawned;
+import net.runelite.api.events.WallObjectSpawned;
 import net.runelite.client.Notifier;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.input.KeyManager;
+import net.runelite.client.input.MouseManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.overlay.OverlayManager;
 
 @Slf4j
 @PluginDescriptor(
@@ -36,6 +56,24 @@ import net.runelite.client.ui.NavigationButton;
 )
 public class AfkHelperPlugin extends Plugin
 {
+	private static final int[] RUNE_POUCH_RUNE_VARBITS = {
+			Varbits.RUNE_POUCH_RUNE1,
+			Varbits.RUNE_POUCH_RUNE2,
+			Varbits.RUNE_POUCH_RUNE3,
+			Varbits.RUNE_POUCH_RUNE4,
+			Varbits.RUNE_POUCH_RUNE5,
+			Varbits.RUNE_POUCH_RUNE6
+	};
+
+	private static final int[] RUNE_POUCH_AMOUNT_VARBITS = {
+			Varbits.RUNE_POUCH_AMOUNT1,
+			Varbits.RUNE_POUCH_AMOUNT2,
+			Varbits.RUNE_POUCH_AMOUNT3,
+			Varbits.RUNE_POUCH_AMOUNT4,
+			Varbits.RUNE_POUCH_AMOUNT5,
+			Varbits.RUNE_POUCH_AMOUNT6
+	};
+
 	@Inject
 	private AfkHelperConfig config;
 
@@ -54,9 +92,52 @@ public class AfkHelperPlugin extends Plugin
 	@Inject
 	private Notifier notifier;
 
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private AfkHelperAudioPlayer audioPlayer;
+
+	@Inject
+	private MouseManager mouseManager;
+
+	@Inject
+	private KeyManager keyManager;
+
+	@Inject
+	private AfkHelperInventoryTracker inventoryTracker;
+
 	private AfkHelperScannerPanel scannerPanel;
 	private NavigationButton navigationButton;
 
+	private AfkHelperSessionOverlay sessionOverlay;
+	private AfkHelperFlashOverlay flashOverlay;
+	private AfkHelperActivityHighlightOverlay activityHighlightOverlay;
+	private AfkHelperAfkCountdown afkCountdown;
+
+	// Idle time based on mouse clicks and key presses only (not movement).
+	private final AfkHelperInputTracker inputTracker =
+			new AfkHelperInputTracker();
+
+	private final AfkHelperSessionStats sessionStats =
+			new AfkHelperSessionStats();
+
+	private final AfkHelperActionTracker actionTracker =
+			new AfkHelperActionTracker();
+
+	private final AfkHelperMonsterKillTracker monsterKillTracker =
+			new AfkHelperMonsterKillTracker();
+
+	private AfkHelperCombatTracker combatTracker;
+	private AfkHelperDamageTracker damageTracker;
+
+	private final Map<Skill, Integer> previousLevels =
+			new EnumMap<>(Skill.class);
+
+	private Skill currentSessionSkill;
+	private GameState previousGameState = GameState.UNKNOWN;
+
+	private boolean sessionStarted;
 	private boolean wasHealthLow;
 	private boolean wasPrayerLow;
 	private boolean logoutWarningSent;
@@ -73,23 +154,78 @@ public class AfkHelperPlugin extends Plugin
 	@Override
 	protected void startUp()
 	{
+		combatTracker = new AfkHelperCombatTracker(sessionStats);
+		damageTracker = new AfkHelperDamageTracker(combatTracker);
+
 		scannerPanel = new AfkHelperScannerPanel(
 				config,
 				configManager,
 				client,
-				clientThread
+				clientThread,
+				this::resetSessionStatistics
 		);
-
-		BufferedImage icon = createPanelIcon();
 
 		navigationButton = NavigationButton.builder()
 				.tooltip("AFK Helper")
-				.icon(icon)
+				.icon(createPanelIcon())
 				.priority(10)
 				.panel(scannerPanel)
 				.build();
 
 		clientToolbar.addNavigation(navigationButton);
+
+		sessionStarted = false;
+		currentSessionSkill = null;
+		previousGameState = client.getGameState();
+
+		actionTracker.reset();
+		monsterKillTracker.clear();
+		resetOrRebaselineInventory(false);
+
+		inputTracker.reset(Math.min(
+				client.getMouseIdleTicks(),
+				client.getKeyboardIdleTicks()));
+		audioPlayer.start();
+		mouseManager.registerMouseListener(inputTracker);
+		keyManager.registerKeyListener(inputTracker);
+
+		afkCountdown = new AfkHelperAfkCountdown(client, inputTracker);
+
+		sessionOverlay = new AfkHelperSessionOverlay(
+				client,
+				sessionStats,
+				inventoryTracker,
+				config,
+				afkCountdown::getIdleTimeText,
+				this::getCurrentTargetName,
+				inventoryTracker::getSupplySummary,
+				() -> "Logout: " + afkCountdown.getLogoutCountdownText(
+						client.getIdleTimeout(),
+						config.logoutWarningSeconds()
+				)
+		);
+
+		flashOverlay = new AfkHelperFlashOverlay(config);
+
+		activityHighlightOverlay =
+				new AfkHelperActivityHighlightOverlay(client, config);
+
+		// Pick up objects already in the scene if switched on while
+		// logged in. From here on, spawn/despawn events keep it current.
+		clientThread.invokeLater((Runnable) () ->
+		{
+			if (activityHighlightOverlay != null)
+			{
+				activityHighlightOverlay.scanScene();
+			}
+		});
+
+		if (previousGameState == GameState.LOGGED_IN)
+		{
+			startSession();
+		}
+
+		updateOverlays();
 
 		wasHealthLow = false;
 		wasPrayerLow = false;
@@ -108,13 +244,57 @@ public class AfkHelperPlugin extends Plugin
 	@Override
 	protected void shutDown()
 	{
+		audioPlayer.stop();
+		mouseManager.unregisterMouseListener(inputTracker);
+		keyManager.unregisterKeyListener(inputTracker);
+
+		if (sessionOverlay != null)
+		{
+			overlayManager.remove(sessionOverlay);
+			sessionOverlay = null;
+		}
+
+		if (flashOverlay != null)
+		{
+			overlayManager.remove(flashOverlay);
+			flashOverlay = null;
+		}
+
+		if (activityHighlightOverlay != null)
+		{
+			overlayManager.remove(activityHighlightOverlay);
+			activityHighlightOverlay = null;
+		}
+
 		if (navigationButton != null)
 		{
 			clientToolbar.removeNavigation(navigationButton);
 			navigationButton = null;
 		}
 
+		if (damageTracker != null)
+		{
+			damageTracker.reset();
+			damageTracker = null;
+		}
+
+		combatTracker = null;
 		scannerPanel = null;
+		afkCountdown = null;
+
+		resetOrRebaselineInventory(false);
+
+		if (!config.saveSessionStatistics())
+		{
+			sessionStats.reset();
+		}
+
+		sessionStarted = false;
+		currentSessionSkill = null;
+		previousLevels.clear();
+
+		actionTracker.reset();
+		monsterKillTracker.clear();
 
 		alertedMonsterIndices.clear();
 		lastMonsterAlerts.clear();
@@ -124,12 +304,335 @@ public class AfkHelperPlugin extends Plugin
 		log.info("AFK Helper stopped!");
 	}
 
+	private String getCurrentTargetName()
+	{
+		if (client.getLocalPlayer() == null)
+		{
+			return "Not attacking";
+		}
+
+		Actor interacting = client.getLocalPlayer().getInteracting();
+
+		if (!(interacting instanceof NPC))
+		{
+			return "Not attacking";
+		}
+
+		String name = ((NPC) interacting).getName();
+
+		return name == null || name.trim().isEmpty()
+				? "Unknown NPC"
+				: name;
+	}
+
+	private void updateOverlays()
+	{
+		if (sessionOverlay != null)
+		{
+			if (config.enabled() && config.sessionOverlayEnabled())
+			{
+				overlayManager.add(sessionOverlay);
+			}
+			else
+			{
+				overlayManager.remove(sessionOverlay);
+			}
+		}
+
+		if (flashOverlay != null)
+		{
+			overlayManager.add(flashOverlay);
+		}
+
+		if (activityHighlightOverlay != null)
+		{
+			if (config.enabled()
+					&& config.eligibleActivityHighlightingEnabled())
+			{
+				overlayManager.add(activityHighlightOverlay);
+			}
+			else
+			{
+				overlayManager.remove(activityHighlightOverlay);
+			}
+		}
+	}
+
+	private void triggerFlash()
+	{
+		if (flashOverlay != null
+				&& config.enabled()
+				&& config.screenFlash())
+		{
+			flashOverlay.triggerFlash();
+		}
+	}
+
+	/**
+	 * Called from the panel's reset button. Clears every session statistic,
+	 * including supplies and profit, and starts counting again from now.
+	 */
+	private void resetSessionStatistics()
+	{
+		clientThread.invokeLater((Runnable) () ->
+		{
+			if (client.getGameState() == GameState.LOGGED_IN
+					&& sessionStarted)
+			{
+				startSession(true);
+			}
+			else
+			{
+				sessionStats.reset();
+				inventoryTracker.reset();
+			}
+
+			updateOverlays();
+		});
+	}
+
+	private void resetOrRebaselineInventory(boolean forceReset)
+	{
+		if (forceReset || !config.saveSessionStatistics())
+		{
+			inventoryTracker.reset();
+		}
+		else
+		{
+			inventoryTracker.rebaseline();
+		}
+	}
+
+	private void startSession()
+	{
+		startSession(false);
+	}
+
+	private void startSession(boolean forceReset)
+	{
+		boolean keepStats =
+				config.saveSessionStatistics() && !forceReset;
+
+		Map<Skill, Integer> startingXp = new EnumMap<>(Skill.class);
+		previousLevels.clear();
+
+		for (Skill skill : Skill.values())
+		{
+			startingXp.put(skill, client.getSkillExperience(skill));
+			previousLevels.put(skill, client.getRealSkillLevel(skill));
+		}
+
+		sessionStats.startSession(startingXp, !keepStats);
+
+		actionTracker.reset();
+		monsterKillTracker.clear();
+		resetOrRebaselineInventory(forceReset);
+
+		if (combatTracker != null)
+		{
+			combatTracker.reset();
+		}
+
+		sessionStarted = true;
+		currentSessionSkill = null;
+
+		updateInventoryTracking();
+		updateEquipmentTracking();
+		updateRunePouchTracking();
+
+		log.info("AFK Helper session started.");
+	}
+
+	private boolean isCombatSkill(Skill skill)
+	{
+		return skill == Skill.ATTACK
+				|| skill == Skill.STRENGTH
+				|| skill == Skill.DEFENCE
+				|| skill == Skill.RANGED
+				|| skill == Skill.MAGIC
+				|| skill == Skill.HITPOINTS;
+	}
+
+	@Subscribe
+	public void onStatChanged(StatChanged event)
+	{
+		if (!config.enabled()
+				|| client.getGameState() != GameState.LOGGED_IN)
+		{
+			return;
+		}
+
+		Skill skill = event.getSkill();
+
+		if (skill == null)
+		{
+			return;
+		}
+
+		int currentLevel = client.getRealSkillLevel(skill);
+		int previousLevel = previousLevels.getOrDefault(skill, currentLevel);
+
+		if (currentLevel > previousLevel)
+		{
+			triggerFlash();
+
+			if (config.levelUpNotifications())
+			{
+				sendAlert("AFK Helper: " + skill.getName()
+								+ " level increased to " + currentLevel + "!",
+						config.levelUpSound());
+			}
+		}
+
+		previousLevels.put(skill, currentLevel);
+
+		if (sessionStarted)
+		{
+			sessionStats.updateXp(
+					skill,
+					client.getSkillExperience(skill)
+			);
+
+			if (isCombatSkill(skill))
+			{
+				currentSessionSkill = skill;
+			}
+		}
+	}
+
+	@Subscribe
+	public void onHitsplatApplied(HitsplatApplied event)
+	{
+		if (!config.enabled()
+				|| !sessionStarted
+				|| client.getGameState() != GameState.LOGGED_IN
+				|| damageTracker == null)
+		{
+			return;
+		}
+
+		if (config.combatPerformanceTracking())
+		{
+			damageTracker.handle(event);
+		}
+	}
+
+	@Subscribe
+	public void onItemContainerChanged(ItemContainerChanged event)
+	{
+		if (!config.enabled()
+				|| !sessionStarted
+				|| client.getGameState() != GameState.LOGGED_IN)
+		{
+			return;
+		}
+
+		if (event.getContainerId() == InventoryID.INVENTORY.getId())
+		{
+			updateInventoryTracking();
+		}
+		else if (event.getContainerId() == InventoryID.EQUIPMENT.getId())
+		{
+			updateEquipmentTracking();
+		}
+	}
+
+	private boolean shouldTrackCombatSupplies()
+	{
+		return config.combatPerformanceTracking()
+				|| config.supplyTrackingEnabled()
+				|| config.profitTrackingEnabled();
+	}
+
+	private void updateInventoryTracking()
+	{
+		if (!shouldTrackCombatSupplies())
+		{
+			return;
+		}
+
+		ItemContainer container =
+				client.getItemContainer(InventoryID.INVENTORY);
+
+		if (container != null)
+		{
+			updateTrackerFromContainer(container, 0);
+		}
+	}
+
+	private void updateEquipmentTracking()
+	{
+		if (!shouldTrackCombatSupplies())
+		{
+			return;
+		}
+
+		ItemContainer container =
+				client.getItemContainer(InventoryID.EQUIPMENT);
+
+		if (container != null)
+		{
+			updateTrackerFromContainer(container, 1);
+		}
+	}
+
+	private void updateTrackerFromContainer(
+			ItemContainer container,
+			int containerType)
+	{
+		Item[] items = container.getItems();
+		int[] itemIds = new int[items.length];
+		int[] quantities = new int[items.length];
+
+		for (int i = 0; i < items.length; i++)
+		{
+			Item item = items[i];
+
+			if (item != null)
+			{
+				itemIds[i] = item.getId();
+				quantities[i] = item.getQuantity();
+			}
+		}
+
+		if (containerType == 0)
+		{
+			inventoryTracker.updateInventory(itemIds, quantities);
+		}
+		else
+		{
+			inventoryTracker.updateEquipment(itemIds, quantities);
+		}
+	}
+
+	private void updateRunePouchTracking()
+	{
+		if (!shouldTrackCombatSupplies())
+		{
+			return;
+		}
+
+		int[] runeIds = new int[RUNE_POUCH_RUNE_VARBITS.length];
+		int[] runeAmounts = new int[RUNE_POUCH_AMOUNT_VARBITS.length];
+
+		for (int i = 0; i < RUNE_POUCH_RUNE_VARBITS.length; i++)
+		{
+			runeIds[i] = client.getVarbitValue(
+					RUNE_POUCH_RUNE_VARBITS[i]
+			);
+
+			runeAmounts[i] = client.getVarbitValue(
+					RUNE_POUCH_AMOUNT_VARBITS[i]
+			);
+		}
+
+		inventoryTracker.updateRunePouch(runeIds, runeAmounts);
+	}
+
 	@Subscribe
 	public void onAnimationChanged(AnimationChanged event)
 	{
 		if (!config.enabled()
-				|| !config.skillingMonitoring()
-				|| !config.activityMonitoring()
 				|| client.getGameState() != GameState.LOGGED_IN
 				|| client.getLocalPlayer() == null
 				|| event.getActor() != client.getLocalPlayer())
@@ -137,11 +640,32 @@ public class AfkHelperPlugin extends Plugin
 			return;
 		}
 
-		Skill skill = getSkillingSkillForAnimation(
-				client.getLocalPlayer().getAnimation()
-		);
+		int animation = client.getLocalPlayer().getAnimation();
+		Skill skill = getSkillingSkillForAnimation(animation);
 
-		if (skill != null && isSkillEnabled(skill))
+		if (skill == null)
+		{
+			for (Skill trackedSkill : Skill.values())
+			{
+				actionTracker.markIdle(trackedSkill);
+			}
+
+			return;
+		}
+
+		if (sessionStarted)
+		{
+			currentSessionSkill = skill;
+
+			if (actionTracker.shouldRecordAction(skill, animation))
+			{
+				sessionStats.recordAction();
+			}
+		}
+
+		if (config.skillingMonitoring()
+				&& config.activityMonitoring()
+				&& isSkillEnabled(skill))
 		{
 			lastSkillingActivity.put(skill, System.currentTimeMillis());
 			skillingWarningsSent.remove(skill);
@@ -200,8 +724,7 @@ public class AfkHelperPlugin extends Plugin
 			return Skill.FIREMAKING;
 		}
 
-		if (contains(animation,
-				5208, 5215, 7259, 5207, 5212))
+		if (contains(animation, 5208, 5215, 7259, 5207, 5212))
 		{
 			return Skill.HUNTER;
 		}
@@ -246,15 +769,152 @@ public class AfkHelperPlugin extends Plugin
 	}
 
 	@Subscribe
+	public void onGameStateChanged(GameStateChanged event)
+	{
+		GameState state = event.getGameState();
+
+		// Objects are re-announced through spawn events once the next
+		// scene has loaded, so anything remembered now is stale.
+		if (activityHighlightOverlay != null
+				&& (state == GameState.LOADING
+				|| state == GameState.LOGIN_SCREEN
+				|| state == GameState.HOPPING))
+		{
+			activityHighlightOverlay.clear();
+		}
+	}
+
+	@Subscribe
+	public void onGameObjectSpawned(GameObjectSpawned event)
+	{
+		if (activityHighlightOverlay != null)
+		{
+			activityHighlightOverlay.objectSpawned(event.getGameObject());
+		}
+	}
+
+	@Subscribe
+	public void onGameObjectDespawned(GameObjectDespawned event)
+	{
+		if (activityHighlightOverlay != null)
+		{
+			activityHighlightOverlay.objectDespawned(event.getGameObject());
+		}
+	}
+
+	@Subscribe
+	public void onWallObjectSpawned(WallObjectSpawned event)
+	{
+		if (activityHighlightOverlay != null)
+		{
+			activityHighlightOverlay.objectSpawned(event.getWallObject());
+		}
+	}
+
+	@Subscribe
+	public void onWallObjectDespawned(WallObjectDespawned event)
+	{
+		if (activityHighlightOverlay != null)
+		{
+			activityHighlightOverlay.objectDespawned(event.getWallObject());
+		}
+	}
+
+	@Subscribe
+	public void onDecorativeObjectSpawned(DecorativeObjectSpawned event)
+	{
+		if (activityHighlightOverlay != null)
+		{
+			activityHighlightOverlay.objectSpawned(
+					event.getDecorativeObject());
+		}
+	}
+
+	@Subscribe
+	public void onDecorativeObjectDespawned(
+			DecorativeObjectDespawned event)
+	{
+		if (activityHighlightOverlay != null)
+		{
+			activityHighlightOverlay.objectDespawned(
+					event.getDecorativeObject());
+		}
+	}
+
+	@Subscribe
+	public void onGroundObjectSpawned(GroundObjectSpawned event)
+	{
+		if (activityHighlightOverlay != null)
+		{
+			activityHighlightOverlay.objectSpawned(event.getGroundObject());
+		}
+	}
+
+	@Subscribe
+	public void onGroundObjectDespawned(GroundObjectDespawned event)
+	{
+		if (activityHighlightOverlay != null)
+		{
+			activityHighlightOverlay.objectDespawned(event.getGroundObject());
+		}
+	}
+
+	@Subscribe
 	public void onGameTick(GameTick event)
 	{
-		if (!config.enabled()
-				|| !config.notificationsEnabled()
-				|| client.getGameState() != GameState.LOGGED_IN)
+		GameState gameState = client.getGameState();
+
+		if (gameState != previousGameState)
+		{
+			if (gameState == GameState.LOGGED_IN)
+			{
+				inputTracker.markInput();
+				startSession();
+			}
+			else if (previousGameState == GameState.LOGGED_IN)
+			{
+				sessionStarted = false;
+				currentSessionSkill = null;
+
+				actionTracker.reset();
+				monsterKillTracker.clear();
+
+				if (combatTracker != null)
+				{
+					combatTracker.reset();
+				}
+
+				if (!config.saveSessionStatistics())
+				{
+					sessionStats.reset();
+				}
+			}
+
+			previousGameState = gameState;
+		}
+
+		updateOverlays();
+
+		if (!config.enabled() || gameState != GameState.LOGGED_IN)
 		{
 			wasHealthLow = false;
 			wasPrayerLow = false;
 			logoutWarningSent = false;
+			return;
+		}
+
+		if (sessionStarted)
+		{
+			updateRunePouchTracking();
+		}
+
+		if (client.getLocalPlayer() != null)
+		{
+			monsterKillTracker.updateTarget(client.getLocalPlayer());
+		}
+
+		if (!config.notificationsEnabled())
+		{
 			return;
 		}
 
@@ -263,6 +923,31 @@ public class AfkHelperPlugin extends Plugin
 		checkMonsterHealth();
 		checkLogoutWarning();
 		checkSkillingInactivity();
+	}
+
+	@Subscribe
+	public void onActorDeath(ActorDeath event)
+	{
+		if (!config.enabled()
+				|| !sessionStarted
+				|| client.getGameState() != GameState.LOGGED_IN)
+		{
+			return;
+		}
+
+		Actor actor = event.getActor();
+
+		if (monsterKillTracker.isTrackedDeath(actor))
+		{
+			if (combatTracker != null)
+			{
+				combatTracker.recordKill(actor);
+			}
+			else
+			{
+				sessionStats.recordMonsterKill(0);
+			}
+		}
 	}
 
 	private void checkSkillingInactivity()
@@ -302,11 +987,11 @@ public class AfkHelperPlugin extends Plugin
 			if (now - lastActivity >= delay
 					&& !skillingWarningsSent.contains(skill))
 			{
-				sendAlert(
-						"AFK Helper: No " + skill.getName()
-								+ " activity detected for "
-								+ config.activityStopDelay() + " seconds."
-				);
+				triggerFlash();
+
+				sendAlert("AFK Helper: No " + skill.getName()
+						+ " activity detected for "
+						+ config.activityStopDelay() + " seconds.");
 
 				skillingWarningsSent.add(skill);
 			}
@@ -344,12 +1029,10 @@ public class AfkHelperPlugin extends Plugin
 
 		if (low && shouldAlert(wasHealthLow, lastHealthAlert))
 		{
-			String message =
-					"AFK Helper: Hitpoints are low! "
-							+ current + "/" + maximum
-							+ " (" + percentage + "%)";
+			sendAlert("AFK Helper: Hitpoints are low! "
+					+ current + "/" + maximum
+					+ " (" + percentage + "%)");
 
-			sendAlert(message);
 			lastHealthAlert = System.currentTimeMillis();
 		}
 
@@ -387,12 +1070,10 @@ public class AfkHelperPlugin extends Plugin
 
 		if (low && shouldAlert(wasPrayerLow, lastPrayerAlert))
 		{
-			String message =
-					"AFK Helper: Prayer is low! "
-							+ current + "/" + maximum
-							+ " (" + percentage + "%)";
+			sendAlert("AFK Helper: Prayer is low! "
+					+ current + "/" + maximum
+					+ " (" + percentage + "%)");
 
-			sendAlert(message);
 			lastPrayerAlert = System.currentTimeMillis();
 		}
 
@@ -401,12 +1082,8 @@ public class AfkHelperPlugin extends Plugin
 
 	private void checkMonsterHealth()
 	{
-		if (!config.monsterMonitoring())
-		{
-			return;
-		}
-
-		if (client.getLocalPlayer() == null)
+		if (!config.monsterMonitoring()
+				|| client.getLocalPlayer() == null)
 		{
 			return;
 		}
@@ -464,11 +1141,10 @@ public class AfkHelperPlugin extends Plugin
 			lastMonsterAlerts.put(npcIndex, currentTime);
 		}
 
-		sendAlert(
-				"AFK Helper: " + npcName
-						+ " is at " + percentage
-						+ "% health!"
-		);
+		triggerFlash();
+
+		sendAlert("AFK Helper: " + npcName
+				+ " is at " + percentage + "% health!");
 	}
 
 	private boolean isSavedMonster(String npcName)
@@ -506,9 +1182,7 @@ public class AfkHelperPlugin extends Plugin
 			return;
 		}
 
-		int mouseIdleTicks = client.getMouseIdleTicks();
-		int keyboardIdleTicks = client.getKeyboardIdleTicks();
-		int idleTicks = Math.min(mouseIdleTicks, keyboardIdleTicks);
+		int idleTicks = inputTracker.getIdleTicks();
 
 		int warningTicks = Math.max(
 				0,
@@ -524,10 +1198,9 @@ public class AfkHelperPlugin extends Plugin
 		{
 			int remainingSeconds = (remainingTicks * 20 + 999) / 1000;
 
-			sendAlert(
-					"AFK Helper: Logout in approximately "
-							+ remainingSeconds + " seconds due to inactivity!"
-			);
+			sendAlert("AFK Helper: Logout in approximately "
+					+ remainingSeconds
+					+ " seconds due to inactivity!");
 
 			logoutWarningSent = true;
 		}
@@ -539,6 +1212,11 @@ public class AfkHelperPlugin extends Plugin
 	}
 
 	private void sendAlert(String message)
+	{
+		sendAlert(message, true);
+	}
+
+	private void sendAlert(String message, boolean playSound)
 	{
 		client.addChatMessage(
 				ChatMessageType.GAMEMESSAGE,
@@ -552,7 +1230,12 @@ public class AfkHelperPlugin extends Plugin
 			notifier.notify(message);
 		}
 
-		log.info(message);
+		if (playSound && config.audioEnabled())
+		{
+			audioPlayer.play(config.defaultSound(), config.audioVolume());
+		}
+
+		log.debug(message);
 	}
 
 	private boolean shouldAlert(boolean wasLow, long lastAlert)
@@ -567,11 +1250,9 @@ public class AfkHelperPlugin extends Plugin
 			return false;
 		}
 
-		long cooldownMillis =
-				config.notificationCooldown() * 1000L;
+		long cooldownMillis = config.notificationCooldown() * 1000L;
 
-		return System.currentTimeMillis() - lastAlert
-				>= cooldownMillis;
+		return System.currentTimeMillis() - lastAlert >= cooldownMillis;
 	}
 
 	private BufferedImage createPanelIcon()

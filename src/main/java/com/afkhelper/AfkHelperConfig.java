@@ -1,4 +1,3 @@
-
 package com.afkhelper;
 
 import net.runelite.client.config.Config;
@@ -28,7 +27,7 @@ public interface AfkHelperConfig extends Config
 	@ConfigSection(name = "General", description = "General AFK Helper settings", position = 0)
 	String generalSection = "general";
 
-	@ConfigSection(name = "Combat", description = "Monster health monitoring settings", position = 1)
+	@ConfigSection(name = "Combat", description = "Monster and combat monitoring", position = 1)
 	String combatSection = "combat";
 
 	@ConfigSection(name = "Player Health", description = "Player hitpoints and prayer warnings", position = 2)
@@ -51,6 +50,12 @@ public interface AfkHelperConfig extends Config
 
 	@ConfigSection(name = "Session Tracker", description = "Session statistics overlay settings", position = 8)
 	String sessionSection = "session";
+
+	@ConfigSection(name = "Activity Highlighting", description = "Highlight nearby eligible skilling activities", position = 9)
+	String highlightingSection = "highlighting";
+
+	@ConfigSection(name = "Supplies and Profit", description = "Track consumables, costs and estimated profit", position = 10)
+	String suppliesSection = "supplies";
 
 	// GENERAL
 
@@ -88,6 +93,12 @@ public interface AfkHelperConfig extends Config
 
 	@ConfigItem(keyName = "monsterAlertOnce", name = "Alert once per target", description = "Avoid repeating alerts for the same target", position = 5, section = combatSection)
 	default boolean monsterAlertOnce() { return true; }
+
+	@ConfigItem(keyName = "combatPerformanceTracking", name = "Combat performance tracking", description = "Track damage, kill rates and kill times", position = 6, section = combatSection)
+	default boolean combatPerformanceTracking() { return true; }
+
+	@ConfigItem(keyName = "monsterHealthDisplay", name = "Show target health", description = "Display current target health where available", position = 7, section = combatSection)
+	default boolean monsterHealthDisplay() { return true; }
 
 	// PLAYER HEALTH
 
@@ -138,6 +149,16 @@ public interface AfkHelperConfig extends Config
 	@Range(min = 5, max = 600)
 	default int activityStopDelay() { return 30; }
 
+	@ConfigItem(keyName = "afkCountdownEnabled", name = "Enable AFK countdown", description = "Display time since activity and expected logout countdown", position = 4, section = afkSection)
+	default boolean afkCountdownEnabled() { return true; }
+
+	@ConfigItem(keyName = "afkCountdownWarningSeconds", name = "Countdown warning time", description = "Warn this many seconds before expected logout", position = 5, section = afkSection)
+	@Range(min = 5, max = 120)
+	default int afkCountdownWarningSeconds() { return 60; }
+
+	@ConfigItem(keyName = "idleWarningEnabled", name = "Warn when activity stops", description = "Notify when a monitored activity stops", position = 6, section = afkSection)
+	default boolean idleWarningEnabled() { return true; }
+
 	// SKILLING
 
 	@ConfigItem(keyName = "skillingMonitoring", name = "Enable skilling monitoring", description = "Monitor supported skilling activities", position = 0, section = skillingSection)
@@ -174,7 +195,7 @@ public interface AfkHelperConfig extends Config
 
 	// APPEARANCE
 
-	@ConfigItem(keyName = "screenFlash", name = "Enable screen flash", description = "Display a visual alert", position = 0, section = appearanceSection)
+	@ConfigItem(keyName = "screenFlash", name = "Enable screen flash", description = "Display a visual alert over the RuneLite game area", position = 0, section = appearanceSection)
 	default boolean screenFlash() { return true; }
 
 	@ConfigItem(keyName = "flashOpacity", name = "Flash opacity", description = "Flash opacity percentage", position = 1, section = appearanceSection)
@@ -197,15 +218,109 @@ public interface AfkHelperConfig extends Config
 	@Range(min = 0, max = 100)
 	default int audioVolume() { return 70; }
 
+	@ConfigItem(keyName = "separateAlertSounds", name = "Separate alert sounds", description = "Use different sounds for different alert types", position = 3, section = audioSection)
+	default boolean separateAlertSounds() { return false; }
+
+	@ConfigItem(keyName = "idleAlertSound", name = "Idle alert sound", description = "Sound used for inactivity warnings", position = 4, section = audioSection)
+	default AlertSound idleAlertSound() { return AlertSound.BEEP; }
+
+	@ConfigItem(keyName = "combatAlertSound", name = "Combat alert sound", description = "Sound used for combat warnings", position = 5, section = audioSection)
+	default AlertSound combatAlertSound() { return AlertSound.DOUBLE_BEEP; }
+
+	@ConfigItem(keyName = "healthAlertSound", name = "Health alert sound", description = "Sound used for HP and Prayer warnings", position = 6, section = audioSection)
+	default AlertSound healthAlertSound() { return AlertSound.SIREN; }
+
 	// SESSION TRACKER
 
-	@ConfigItem(keyName = "sessionOverlayEnabled", name = "Enable session overlay", description = "Show the live session statistics overlay", position = 0, section = sessionSection)
+	@ConfigItem(keyName = "sessionOverlayEnabled", name = "Show Session Tracker", description = "Master switch for the session statistics overlay", position = 0, section = sessionSection)
 	default boolean sessionOverlayEnabled() { return true; }
 
 	@ConfigItem(keyName = "sessionOverlayOpacity", name = "Overlay opacity", description = "Transparency level of the session overlay", position = 1, section = sessionSection)
 	@Range(min = 10, max = 100)
-	default int sessionOverlayOpacity() { return 50; }
+	default int sessionOverlayOpacity() { return 80; }
 
 	@ConfigItem(keyName = "saveSessionStatistics", name = "Save session statistics", description = "Keep session statistics when logging out and back in", position = 2, section = sessionSection)
 	default boolean saveSessionStatistics() { return false; }
+
+	@ConfigItem(keyName = "overlayShowDuration", name = "Show session duration", description = "Display elapsed session time", position = 3, section = sessionSection)
+	default boolean overlayShowDuration() { return true; }
+
+	@ConfigItem(keyName = "overlayShowXpGained", name = "Show XP gained", description = "Display experience gained this session", position = 4, section = sessionSection)
+	default boolean overlayShowXpGained() { return true; }
+
+	@ConfigItem(keyName = "overlayShowXpPerHour", name = "Show XP per hour", description = "Display experience gained per hour", position = 5, section = sessionSection)
+	default boolean overlayShowXpPerHour() { return true; }
+
+	@ConfigItem(keyName = "overlayShowActions", name = "Show actions", description = "Display tracked actions", position = 6, section = sessionSection)
+	default boolean overlayShowActions() { return true; }
+
+	@ConfigItem(keyName = "overlayShowKills", name = "Show kills", description = "Display monsters killed", position = 7, section = sessionSection)
+	default boolean overlayShowKills() { return true; }
+
+	@ConfigItem(keyName = "overlayShowKillsPerHour", name = "Show kills per hour", description = "Display kill rate", position = 8, section = sessionSection)
+	default boolean overlayShowKillsPerHour() { return true; }
+
+	@ConfigItem(keyName = "overlayShowDamage", name = "Show damage", description = "Display total damage dealt", position = 9, section = sessionSection)
+	default boolean overlayShowDamage() { return true; }
+
+	@ConfigItem(keyName = "overlayShowDamagePerHour", name = "Show damage per hour", description = "Display hourly damage rate", position = 10, section = sessionSection)
+	default boolean overlayShowDamagePerHour() { return true; }
+
+	@ConfigItem(keyName = "overlayShowAverageKillTime", name = "Show average kill time", description = "Display average monster kill duration", position = 11, section = sessionSection)
+	default boolean overlayShowAverageKillTime() { return true; }
+
+	@ConfigItem(keyName = "overlayShowAfkStatus", name = "Show AFK status", description = "Display current inactivity status", position = 12, section = sessionSection)
+	default boolean overlayShowAfkStatus() { return true; }
+
+	@ConfigItem(keyName = "overlayShowLogoutCountdown", name = "Show logout countdown", description = "Display estimated time until idle logout", position = 13, section = sessionSection)
+	default boolean overlayShowLogoutCountdown() { return true; }
+
+	@ConfigItem(keyName = "overlayShowCombatStatus", name = "Show combat status", description = "Display current combat target or status", position = 14, section = sessionSection)
+	default boolean overlayShowCombatStatus() { return true; }
+
+	@ConfigItem(keyName = "overlayShowSuppliesUsed", name = "Show supplies used", description = "Display tracked supplies consumed", position = 15, section = sessionSection)
+	default boolean overlayShowSuppliesUsed() { return true; }
+
+	@ConfigItem(keyName = "overlayShowItemsGained", name = "Show items gained", description = "Display tracked inventory gains", position = 16, section = sessionSection)
+	default boolean overlayShowItemsGained() { return true; }
+
+	@ConfigItem(keyName = "overlayShowEstimatedProfit", name = "Show estimated profit", description = "Display estimated session profit or loss", position = 17, section = sessionSection)
+	default boolean overlayShowEstimatedProfit() { return true; }
+
+	@ConfigItem(keyName = "overlayShowSupplyCost", name = "Show supply cost", description = "Display total consumable cost", position = 18, section = sessionSection)
+	default boolean overlayShowSupplyCost() { return true; }
+
+	@ConfigItem(keyName = "overlayShowSupplyCostPerHour", name = "Show supply cost per hour", description = "Display hourly consumable cost", position = 19, section = sessionSection)
+	default boolean overlayShowSupplyCostPerHour() { return true; }
+
+	@ConfigItem(keyName = "overlayShowCombatCost", name = "Show combat cost", description = "Display total ammunition and rune cost", position = 20, section = sessionSection)
+	default boolean overlayShowCombatCost() { return true; }
+
+	@ConfigItem(keyName = "overlayShowCombatCostPerHour", name = "Show combat cost per hour", description = "Display hourly ammunition and rune cost", position = 21, section = sessionSection)
+	default boolean overlayShowCombatCostPerHour() { return true; }
+
+	// ACTIVITY HIGHLIGHTING
+
+	@ConfigItem(keyName = "eligibleActivityHighlightingEnabled", name = "Enable eligible activity highlighting", description = "Highlight recognised skilling activities when your level meets their requirement", position = 0, section = highlightingSection)
+	default boolean eligibleActivityHighlightingEnabled() { return true; }
+
+	// SUPPLIES AND PROFIT
+
+	@ConfigItem(keyName = "supplyTrackingEnabled", name = "Enable supply tracking", description = "Track consumable items used during the session", position = 0, section = suppliesSection)
+	default boolean supplyTrackingEnabled() { return true; }
+
+	@ConfigItem(keyName = "profitTrackingEnabled", name = "Enable profit tracking", description = "Calculate estimated item costs and output value using Grand Exchange prices", position = 1, section = suppliesSection)
+	default boolean profitTrackingEnabled() { return true; }
+
+	@ConfigItem(keyName = "showSupplyOverlay", name = "Show supply and profit statistics", description = "Display consumable costs and estimated profit or loss in the session overlay", position = 2, section = suppliesSection)
+	default boolean showSupplyOverlay() { return true; }
+
+	@ConfigItem(keyName = "showCostPerHour", name = "Show cost or profit per hour", description = "Display estimated hourly consumable costs or skilling profit", position = 3, section = suppliesSection)
+	default boolean showCostPerHour() { return true; }
+
+	@ConfigItem(keyName = "trackCombatAmmoAndRunes", name = "Track ammunition and runes", description = "Estimate ammunition and rune costs for the current combat style", position = 4, section = suppliesSection)
+	default boolean trackCombatAmmoAndRunes() { return true; }
+
+	@ConfigItem(keyName = "trackSkillingMaterials", name = "Track skilling materials", description = "Estimate consumed materials and output value for supported skills", position = 5, section = suppliesSection)
+	default boolean trackSkillingMaterials() { return true; }
 }
