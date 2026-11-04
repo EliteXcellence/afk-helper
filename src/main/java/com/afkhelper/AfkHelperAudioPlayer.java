@@ -1,38 +1,42 @@
 package com.afkhelper;
 
+import java.io.ByteArrayInputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.atomic.AtomicBoolean;
 import javax.inject.Inject;
 import javax.inject.Singleton;
-import javax.sound.sampled.AudioFormat;
-import javax.sound.sampled.AudioSystem;
-import javax.sound.sampled.SourceDataLine;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.audio.AudioPlayer;
 
 /**
- * Plays the short synthesised alert sounds.
- *
+ * Plays the short synthesised alert sounds through RuneLite's AudioPlayer.
  * The whole sound (tones and the gaps between them) is rendered into one
- * buffer up front, so nothing needs to sleep, and playback runs on
- * RuneLite's shared executor instead of a thread of our own. Only one alert
- * plays at a time; a new one requested while another is playing is skipped.
+ * in-memory WAV file, so nothing needs to sleep, and playback is handed to
+ * RuneLite's shared executor rather than a thread of our own. Only one
+ * alert plays at a time; a new one requested while another is still
+ * sounding is skipped.
  */
 @Slf4j
 @Singleton
 public class AfkHelperAudioPlayer
 {
-    private static final float SAMPLE_RATE = 44100f;
+    private static final int SAMPLE_RATE = 44100;
     private static final int GAP_MS = 70;
 
+    private final AudioPlayer audioPlayer;
     private final ScheduledExecutorService executor;
-    private final AtomicBoolean playing = new AtomicBoolean();
 
     private volatile boolean stopped;
-    private volatile SourceDataLine currentLine;
+    private volatile long soundingUntilMillis;
 
     @Inject
-    public AfkHelperAudioPlayer(ScheduledExecutorService executor)
+    public AfkHelperAudioPlayer(
+            AudioPlayer audioPlayer,
+            ScheduledExecutorService executor)
     {
+        this.audioPlayer = audioPlayer;
         this.executor = executor;
     }
 
@@ -42,87 +46,90 @@ public class AfkHelperAudioPlayer
         stopped = false;
     }
 
+    /** Refuse new sounds (call when the plugin stops). */
+    public void stop()
+    {
+        stopped = true;
+    }
+
     public void play(AfkHelperConfig.AlertSound sound, int volume)
     {
-        if (sound == null || stopped)
+        if (sound == null || stopped || volume <= 0)
         {
             return;
         }
 
-        if (!playing.compareAndSet(false, true))
+        long now = System.currentTimeMillis();
+
+        if (now < soundingUntilMillis)
         {
             return;
         }
+
+        int[][] tones = getTones(sound);
+        soundingUntilMillis = now + getDurationMillis(tones);
+
+        // Volume is applied as gain (dB) by the AudioPlayer: 100% = 0 dB.
+        float gain = (float) (20.0 * Math.log10(
+                Math.min(100, volume) / 100.0));
 
         try
         {
-            executor.submit(() ->
-            {
-                try
-                {
-                    playSound(sound, volume);
-                }
-                finally
-                {
-                    playing.set(false);
-                }
-            });
+            executor.submit(() -> playSound(tones, gain));
         }
         catch (RuntimeException ex)
         {
-            playing.set(false);
+            soundingUntilMillis = 0;
             log.debug("Could not schedule alert sound", ex);
         }
     }
 
-    private void playSound(AfkHelperConfig.AlertSound sound, int volume)
+    private void playSound(int[][] tones, float gain)
     {
-        byte[] audio = render(
-                getTones(sound),
-                Math.max(0, Math.min(100, volume)) / 100f);
-
-        if (audio.length == 0)
+        if (stopped)
         {
             return;
         }
 
-        AudioFormat format = new AudioFormat(SAMPLE_RATE, 16, 1, true, false);
-
         // Audio is optional; alerts still work without sound.
-        try (SourceDataLine line = AudioSystem.getSourceDataLine(format))
+        try
         {
-            currentLine = line;
-
-            if (stopped)
-            {
-                return;
-            }
-
-            line.open(format);
-            line.start();
-            line.write(audio, 0, audio.length);
-            line.drain();
-            line.stop();
+            audioPlayer.play(
+                    new ByteArrayInputStream(toWav(render(tones))),
+                    gain);
         }
         catch (Exception ex)
         {
             log.debug("Could not play alert sound", ex);
         }
-        finally
-        {
-            currentLine = null;
-        }
     }
 
-    /** Renders every tone, separated by short silences, into one buffer. */
-    private byte[] render(int[][] tones, float volume)
+    private int getDurationMillis(int[][] tones)
     {
-        int gapSamples = (int) (SAMPLE_RATE * GAP_MS / 1000);
+        int total = 0;
+
+        for (int i = 0; i < tones.length; i++)
+        {
+            total += tones[i][1];
+
+            if (i < tones.length - 1)
+            {
+                total += GAP_MS;
+            }
+        }
+
+        return total;
+    }
+
+    /** Renders every tone, separated by short silences, as 16-bit PCM. */
+    private byte[] render(int[][] tones)
+    {
+        int gapSamples = SAMPLE_RATE * GAP_MS / 1000;
         int totalSamples = 0;
 
         for (int i = 0; i < tones.length; i++)
         {
-            totalSamples += (int) (SAMPLE_RATE * tones[i][1] / 1000);
+            totalSamples += SAMPLE_RATE * tones[i][1] / 1000;
 
             if (i < tones.length - 1)
             {
@@ -136,7 +143,7 @@ public class AfkHelperAudioPlayer
         for (int t = 0; t < tones.length; t++)
         {
             int frequency = tones[t][0];
-            int samples = (int) (SAMPLE_RATE * tones[t][1] / 1000);
+            int samples = SAMPLE_RATE * tones[t][1] / 1000;
 
             for (int i = 0; i < samples; i++)
             {
@@ -153,7 +160,6 @@ public class AfkHelperAudioPlayer
                 short value = (short) (
                         Math.sin(angle)
                                 * Short.MAX_VALUE
-                                * volume
                                 * Math.max(0, envelope)
                 );
 
@@ -166,6 +172,33 @@ public class AfkHelperAudioPlayer
         }
 
         return buffer;
+    }
+
+    /** Wraps raw 16-bit mono PCM in a standard 44-byte WAV header. */
+    private byte[] toWav(byte[] pcm)
+    {
+        ByteBuffer wav = ByteBuffer
+                .allocate(44 + pcm.length)
+                .order(ByteOrder.LITTLE_ENDIAN);
+
+        wav.put("RIFF".getBytes(StandardCharsets.US_ASCII));
+        wav.putInt(36 + pcm.length);
+        wav.put("WAVE".getBytes(StandardCharsets.US_ASCII));
+
+        wav.put("fmt ".getBytes(StandardCharsets.US_ASCII));
+        wav.putInt(16);                    // fmt chunk size
+        wav.putShort((short) 1);           // PCM
+        wav.putShort((short) 1);           // mono
+        wav.putInt(SAMPLE_RATE);
+        wav.putInt(SAMPLE_RATE * 2);       // byte rate
+        wav.putShort((short) 2);           // block align
+        wav.putShort((short) 16);          // bits per sample
+
+        wav.put("data".getBytes(StandardCharsets.US_ASCII));
+        wav.putInt(pcm.length);
+        wav.put(pcm);
+
+        return wav.array();
     }
 
     private int[][] getTones(AfkHelperConfig.AlertSound sound)
@@ -203,20 +236,6 @@ public class AfkHelperAudioPlayer
                 return new int[][] {
                         {880, 180}
                 };
-        }
-    }
-
-    /** Stop any sound that is playing and refuse new ones. */
-    public void stop()
-    {
-        stopped = true;
-
-        SourceDataLine line = currentLine;
-
-        if (line != null)
-        {
-            // Closing also unblocks a drain() waiting on the playback thread.
-            line.close();
         }
     }
 }
